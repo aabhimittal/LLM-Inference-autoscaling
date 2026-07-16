@@ -1,0 +1,80 @@
+# Example Kubernetes Horizontal Pod Autoscaler driven by the queue-depth metric
+# the service exports at /metrics. This is the *external* counterpart to the
+# in-process autoscaler: the app resizes its own concurrency gate, while the HPA
+# adds/removes pods based on the same load signal scraped by Prometheus.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llm-inference
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: llm-inference
+  template:
+    metadata:
+      labels:
+        app: llm-inference
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+        - name: llm-inference
+          image: llm-inference-autoscaling:latest
+          ports:
+            - containerPort: 8000
+          env:
+            - name: LLM_MIN_REPLICAS
+              value: "1"
+            - name: LLM_MAX_REPLICAS
+              value: "20"
+            - name: LLM_TARGET_CONCURRENCY
+              value: "4"
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8000
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "2"
+              memory: "2Gi"
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: llm-inference
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: llm-inference
+  minReplicas: 1
+  maxReplicas: 20
+  metrics:
+    # Scale on the custom queue-depth gauge (requires prometheus-adapter to
+    # surface llm_queue_depth as a pods metric).
+    - type: Pods
+      pods:
+        metric:
+          name: llm_queue_depth
+        target:
+          type: AverageValue
+          averageValue: "4"
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 15
+    scaleDown:
+      stabilizationWindowSeconds: 60
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 30

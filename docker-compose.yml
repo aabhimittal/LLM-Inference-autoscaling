@@ -1,0 +1,18 @@
+services:
+  llm-inference:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      # Cost controls
+      LLM_REQUEST_BUDGET_USD: "0.50"
+      LLM_USER_DAILY_BUDGET_USD: "25.0"
+      # Autoscaling (in-process gate; also exported at /metrics for an HPA)
+      LLM_MIN_REPLICAS: "1"
+      LLM_MAX_REPLICAS: "20"
+      LLM_TARGET_CONCURRENCY: "4"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz')"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
