@@ -41,6 +41,9 @@ app/
     base.py            Provider protocol, Completion, StreamChunk
     mock.py            deterministic offline provider (+ failure injection)
     vllm.py            vLLM OpenAI-compatible adapter, buffered + streaming
+  cache.py             response cache (memory/Redis) + single-flight
+  breaker.py           circuit breaker per backend + registry
+  ratelimit.py         token-bucket rate limiter (memory/Redis)
   gate.py              resizable concurrency gate (admission control)
   autoscaler.py        replica-count control loop
   metrics.py           in-memory counters + Prometheus export
@@ -399,11 +402,115 @@ autoscaler scales on.
 
 ---
 
-## Step 14 — Verifying it
+## Step 14 — Response caching (`cache.py`)
+
+The cheapest token is the one never generated. Identical prompts are extremely
+common in production — retries, shared prompt templates, polling clients,
+evaluation loops — and a hit costs **$0** and returns in microseconds.
+
+Two things make the cache *correct* rather than merely fast:
+
+**The key must cover everything that changes the output.** Keying on the prompt
+alone will serve a `small`-model answer to a request that paid for `large`, or a
+50-token answer to one that asked for 2000. So the key is
+`sha256(version, model, prompt, max_output_tokens)`. The version prefix means a
+behaviour change can invalidate everything by bumping one constant.
+
+**Stampede protection.** When a hot key expires under load, N concurrent
+identical requests all miss and all call the model. `SingleFlight` collapses
+them into one generation that everybody shares. Followers use `asyncio.shield`,
+so a follower giving up cannot cancel the work the others are waiting on.
+
+Three deliberate policy choices, each of which is tested:
+
+| Choice | Reasoning |
+|---|---|
+| Hits **bypass the budget** and cost $0 | No tokens were generated; charging for them would defeat the purpose |
+| Hits **bypass the capacity gate** | A cache that exists to shed load must not itself be limited by that load |
+| Failed and **truncated generations are never cached** | One transient blip would otherwise become a permanently wrong answer served at full speed for the whole TTL |
+
+> **Caveat worth knowing:** the cache is *content-addressed, not user-scoped* —
+> two users sending an identical prompt to an identical model share one entry.
+> That is what makes it effective on shared templates, but it means the cache
+> must never hold user-specific content. Scope it per tenant (or set
+> `LLM_CACHE=none`) if prompts can carry another user's private data.
+
+`RedisCache` shares entries fleet-wide; a per-process cache dilutes its hit rate
+with every pod you add. Cache failures always degrade to a miss — an
+optimisation must never take down correctness or availability.
+
+---
+
+## Step 15 — Circuit breaking and failover (`breaker.py`)
+
+When a vLLM replica dies, every request still queues against it, waits out the
+full timeout, and fails. One dead backend becomes fleet-wide latency: worker
+slots fill with doomed requests, the queue grows, and the autoscaler adds pods
+that also fail.
+
+```
+CLOSED ──(N consecutive failures)──► OPEN
+  ▲                                   │
+  │                        (recovery timeout elapses)
+  │                                   ▼
+  └────────(probe succeeds)────── HALF_OPEN
+                                      │
+                    (probe fails) ────┘ back to OPEN, timer restarts
+```
+
+Two subtleties that are easy to get wrong and are pinned by tests:
+
+- **Only server-side faults count.** A `400` means *we* sent something invalid;
+  tripping on client errors takes a healthy backend out of rotation because of
+  one malformed prompt.
+- **HALF_OPEN admits exactly one probe.** Releasing full load onto a recovering
+  backend knocks it straight back down.
+
+Breakers are per model, so a dead 70B backend does not stop the 1.5B backend
+from serving. On failure the service **fails over** by re-routing with the failed
+model excluded — reusing `route()` means the replacement still respects the
+complexity tier, the budget, and the context window. A pinned `force_model` is
+never silently replaced, and the response is billed at the price of the model
+that actually served it.
+
+---
+
+## Step 16 — Rate limiting and load shedding
+
+**Rate limits and spend budgets solve different problems, and you need both.** A
+dollar budget caps total damage but does nothing about a client firing 10,000
+cheap requests a second — that saturates the queue long before the budget
+notices. Conversely a rate limit alone lets a patient client burn the whole
+budget on expensive calls.
+
+`TokenBucketLimiter` permits **bursts** (real clients are bursty; a strict
+per-second limiter rejects traffic the system could absorb) while bounding the
+sustained rate. The Redis variant is atomic via Lua for the same reason the
+ledger is.
+
+Note the deliberately *opposite* outage policy: the rate limiter **fails open**,
+the spend ledger **fails closed**. A limiter is abuse control — rejecting all
+traffic because it is unreachable converts a dependency blip into a full outage.
+A ledger is cost control — serving unmetered traffic converts a blip into an
+unbounded bill.
+
+**Load shedding** completes the picture. `admission_timeout_s` bounds how long a
+request may sit in the queue; past that it is rejected with `503`. Without a
+deadline a saturated service accumulates requests whose clients have already
+given up and spends GPU time answering nobody. The critical detail: **a shed
+request refunds its reservation**, or every timeout silently bills the user for
+a generation that never happened — precisely when the system is already stressed.
+
+Throttling responses carry `Retry-After`, which turns a blind retry storm into
+coordinated backoff.
+
+---
+
+## Step 17 — Verifying it
 
 ```bash
 pip install -r requirements-dev.txt
-pytest                        # 103 tests
+pytest                        # 198 tests
 python examples/demo.py       # end-to-end, no API keys
 uvicorn app.main:app --reload
 ```

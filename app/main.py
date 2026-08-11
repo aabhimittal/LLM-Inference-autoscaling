@@ -20,25 +20,44 @@ from typing import AsyncIterator
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import PlainTextResponse, StreamingResponse
 
+from .breaker import CircuitOpenError
 from .cost import LedgerUnavailableError, UserBudgetExceededError
 from .factory import build_service
 from .providers import ProviderError, ProviderTimeoutError, ProviderUnavailableError
-from .router import BudgetExceededError, ContextTooLargeError, route
+from .ratelimit import RateLimitExceededError
+from .router import (
+    BudgetExceededError,
+    ContextTooLargeError,
+    NoModelAvailableError,
+    route,
+)
 from .schemas import InferenceRequest, InferenceResponse, RouteExplainResponse
-from .service import InferenceService
+from .service import AdmissionTimeoutError, InferenceService
 
 # Domain exception -> HTTP status. Kept in one place so the buffered and
-# streaming paths cannot drift apart.
+# streaming paths cannot drift apart. Order matters: the first match wins, so
+# subclasses must precede their base (ProviderError is last for that reason).
 _STATUS_MAP = [
     (BudgetExceededError, 402),       # request budget cannot be met
     (UserBudgetExceededError, 429),   # user daily budget exhausted
+    (RateLimitExceededError, 429),    # too many requests
     (ContextTooLargeError, 413),      # prompt exceeds every context window
     (LedgerUnavailableError, 503),    # cost store down, policy is fail-closed
+    (AdmissionTimeoutError, 503),     # queue too deep, request shed
+    (CircuitOpenError, 503),          # backend circuit open, failing fast
+    (NoModelAvailableError, 503),     # every candidate model excluded
     (ProviderTimeoutError, 504),      # upstream model server too slow
     (ProviderUnavailableError, 503),  # upstream model server unreachable
     (ProviderError, 502),             # upstream returned something unusable
     (ValueError, 400),                # bad model name / task type
 ]
+
+# Errors that should tell the client when to come back. Sending Retry-After
+# turns a blind retry storm into coordinated backoff.
+_RETRY_AFTER_ATTR = {
+    RateLimitExceededError: "retry_after_s",
+    CircuitOpenError: "retry_after_s",
+}
 
 
 def _status_for(exc: Exception) -> int | None:
@@ -52,7 +71,14 @@ def _as_http(exc: Exception) -> HTTPException:
     status = _status_for(exc)
     if status is None:
         raise exc
-    return HTTPException(status_code=status, detail=str(exc))
+    headers = None
+    for exc_type, attr in _RETRY_AFTER_ATTR.items():
+        if isinstance(exc, exc_type):
+            seconds = getattr(exc, attr, None)
+            if seconds is not None and seconds != float("inf"):
+                headers = {"retry-after": str(max(1, int(seconds) + 1))}
+            break
+    return HTTPException(status_code=status, detail=str(exc), headers=headers)
 
 
 def create_app(service: InferenceService | None = None) -> FastAPI:
@@ -223,6 +249,23 @@ def create_app(service: InferenceService | None = None) -> FastAPI:
     async def metrics():
         svc.metrics.set_queue_depth(svc.gate.waiting)
         return svc.metrics.prometheus()
+
+    @app.get("/v1/status")
+    async def status():
+        """Operational snapshot: what is scaled, cached, and broken right now."""
+        snap = svc.metrics.snapshot()
+        return {
+            "replicas": svc.autoscaler.current_replicas,
+            "capacity": svc.gate.capacity,
+            "in_flight": svc.gate.active,
+            "queue_depth": svc.gate.waiting,
+            "cache_hit_rate": snap["cache_hit_rate"],
+            "circuits": svc.breakers.states(),
+            "open_circuits": svc.breakers.open_backends(),
+            "shed": snap["total_shed"],
+            "rate_limited": snap["total_rate_limited"],
+            "failovers": snap["total_failovers"],
+        }
 
     return app
 

@@ -8,9 +8,11 @@ from __future__ import annotations
 
 import logging
 
+from .cache import InMemoryCache, RedisCache
 from .config import Settings
 from .cost import Ledger, RedisLedger
 from .providers import MockProvider, VLLMProvider
+from .ratelimit import RedisRateLimiter, TokenBucketLimiter
 from .service import InferenceService
 
 log = logging.getLogger(__name__)
@@ -45,15 +47,52 @@ def build_ledger(settings: Settings):
     raise ValueError(f"unknown ledger backend {backend!r} (use 'memory' or 'redis')")
 
 
+def build_cache(settings: Settings):
+    backend = (settings.cache_backend or "memory").strip().lower()
+    if backend == "none":
+        return None
+    if backend == "memory":
+        return InMemoryCache(max_entries=settings.cache_max_entries)
+    if backend == "redis":
+        # A shared cache is what makes the hit rate hold up as replicas are
+        # added; a per-process cache dilutes with every pod.
+        return RedisCache(settings.redis_url)
+    raise ValueError(
+        f"unknown cache backend {backend!r} (use 'none', 'memory', or 'redis')"
+    )
+
+
+def build_rate_limiter(settings: Settings):
+    if not settings.rate_limit_enabled:
+        return None
+    if (settings.ledger_backend or "").strip().lower() == "redis":
+        # Match the ledger: if budgets are fleet-wide, rate limits must be too,
+        # or the effective limit multiplies by the replica count.
+        return RedisRateLimiter(
+            settings.redis_url,
+            capacity=settings.rate_limit_burst,
+            refill_per_second=settings.rate_limit_per_second,
+        )
+    return TokenBucketLimiter(
+        capacity=settings.rate_limit_burst,
+        refill_per_second=settings.rate_limit_per_second,
+    )
+
+
 def build_service(settings: Settings | None = None) -> InferenceService:
     settings = settings or Settings.from_env()
-    provider = build_provider(settings)
-    ledger = build_ledger(settings)
     log.info(
-        "starting service provider=%s ledger=%s replicas=%d-%d",
+        "starting service provider=%s ledger=%s cache=%s replicas=%d-%d",
         settings.provider_backend,
         settings.ledger_backend,
+        settings.cache_backend,
         settings.min_replicas,
         settings.max_replicas,
     )
-    return InferenceService(settings, provider=provider, ledger=ledger)
+    return InferenceService(
+        settings,
+        provider=build_provider(settings),
+        ledger=build_ledger(settings),
+        cache=build_cache(settings),
+        rate_limiter=build_rate_limiter(settings),
+    )

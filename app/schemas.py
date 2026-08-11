@@ -38,6 +38,10 @@ class InferenceResponse(BaseModel):
     downgraded: bool = Field(
         ..., description="True if the budget check switched to a cheaper model."
     )
+    cached: bool = Field(
+        False,
+        description="True if served from cache: no tokens generated, cost_usd is 0.",
+    )
     routing_notes: List[str]
 
 

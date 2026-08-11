@@ -9,9 +9,11 @@ request's projected token cost would blow its budget, the router automatically
 switches it down to a model that fits.
 
 Backed by **vLLM** for real inference, **Redis** for fleet-wide budget
-enforcement, and **SSE streaming** that still bills correctly when a client
-disconnects mid-generation. Runs end to end with **no API keys or GPU** thanks to
-a deterministic mock provider, so you can try the whole pipeline offline.
+enforcement, **SSE streaming** that still bills correctly when a client
+disconnects mid-generation, and a **response cache**, **circuit breaker**,
+**rate limiter**, and **load shedding** for production hardening. Runs end to
+end with **no API keys or GPU** thanks to a deterministic mock provider, so you
+can try the whole pipeline offline.
 
 > New here? Read **[docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md)** for a
 > step-by-step, module-by-module build of the whole system.
@@ -35,6 +37,11 @@ lacks:
    `/metrics` queue-depth signal for a Kubernetes HPA to scale pods.
 4. **Streaming that bills honestly** — a client who disconnects halfway through
    is still charged for the tokens the GPU actually produced.
+5. **A response cache** — identical prompts are served for **$0** without
+   touching a GPU, with stampede protection so an expired hot key doesn't
+   thunder.
+6. **Resilience** — per-model circuit breakers with failover, token-bucket rate
+   limiting, and admission deadlines that shed rather than queue forever.
 
 ## Architecture
 
@@ -47,12 +54,15 @@ lacks:
                                      ▼
                        gate (6) ─► autoscaler (7) ─► /metrics ─► HPA
 
+  (0) app/ratelimit.py     token bucket; cheapest possible rejection
   (1) app/complexity.py    score task difficulty (no model call)
   (2) app/router.py        pick cheapest capable model
   (3) app/router.py        token/cost budget check -> switch model down if needed
+  (3b) app/cache.py        cache hit? return for $0, skipping 4-6 entirely
   (4) app/cost/            reserve -> settle; memory (1 node) or Redis (fleet)
   (5) app/providers/       mock (offline) or vLLM; buffered or streamed
-  (6) app/gate.py          admission control; its wait queue is the load signal
+       app/breaker.py      per-model circuit breaker + failover to another model
+  (6) app/gate.py          admission control + deadline; wait queue is the signal
   (7) app/autoscaler.py    ceil(load / target) with fast-up / slow-down cooldowns
 ```
 
@@ -108,6 +118,7 @@ curl -N localhost:8000/v1/infer/stream -H 'content-type: application/json' \
 | `GET /metrics` | Prometheus metrics (in-flight, queue depth, tokens, cost). |
 | `GET /healthz` | Liveness + current replica count. |
 | `GET /readyz` | Readiness — verifies the cost store is reachable. |
+| `GET /v1/status` | Operational snapshot: capacity, cache hit rate, open circuits, shed/throttle counts. |
 
 **Request fields**: `prompt` (required), `user_id`, `task_type`
 (`simple|moderate|complex` — overrides the classifier), `max_output_tokens`,
@@ -122,7 +133,8 @@ terminated by `[DONE]`. Admission failures arrive as a normal HTTP status
 **Error codes:** `402` request budget can't be met · `429` user daily budget
 exhausted · `413` prompt exceeds every context window · `400` bad input ·
 `502/503/504` upstream model server unusable/unreachable/too slow · `503` cost
-store unreachable while fail-closed.
+store unreachable while fail-closed, request shed, or circuit open. Throttling
+and circuit responses carry `Retry-After`.
 
 ## Model catalog
 
@@ -153,6 +165,13 @@ All via environment variables (see `app/config.py`):
 | `LLM_LEDGER` | `memory` | `memory` (per process) or `redis` (fleet-wide). |
 | `LLM_REDIS_URL` | `redis://localhost:6379/0` | Ledger store. |
 | `LLM_REDIS_FAIL_CLOSED` | `true` | On Redis outage: reject (`true`) or serve unmetered (`false`). |
+| `LLM_CACHE` | `memory` | `none`, `memory`, or `redis` (shared across replicas). |
+| `LLM_CACHE_TTL_S` | `300` | Cached response lifetime. |
+| `LLM_ADMISSION_TIMEOUT_S` | `30` | Max queue wait before shedding (`0` = wait forever). |
+| `LLM_RATE_LIMIT_ENABLED` | `true` | Per-user token-bucket throttling. |
+| `LLM_RATE_LIMIT_BURST` / `LLM_RATE_LIMIT_PER_SECOND` | `20` / `5` | Bucket capacity and sustained rate. |
+| `LLM_BREAKER_THRESHOLD` / `LLM_BREAKER_RECOVERY_S` | `5` / `30` | Consecutive faults to open a circuit, and the probe delay. |
+| `LLM_FALLBACK_ENABLED` | `true` | Retry on another model when a backend is sick. |
 
 ### Using vLLM
 
@@ -202,11 +221,34 @@ docs/        IMPLEMENTATION.md — step-by-step build guide
 ## Testing
 
 ```bash
-pytest -q      # 103 tests
+pytest -q      # 198 tests
 ```
 
-Beyond per-component coverage, `tests/test_edge_cases.py` targets the failure
-modes that cost real money or wake people up:
+Beyond per-component coverage, the edge-case suites target the failure modes
+that cost real money or wake people up:
+
+- **Caching** (`test_cache.py`, `test_resilience.py`) — the key covers model and
+  output ceiling, so a cheap model's answer is never served to a request that
+  paid for the expensive one; TTL and LRU bounds; failed and **truncated**
+  generations are never cached; ten concurrent misses collapse to one
+  generation; a follower disconnecting doesn't cancel the shared work; a
+  poisoned Redis entry degrades to a miss instead of serving garbage.
+- **Circuit breaking** (`test_breaker.py`) — client errors never trip the
+  breaker (one bad prompt must not evict a healthy backend); HALF_OPEN admits
+  exactly one probe; a failed probe restarts the full timer; breakers are
+  per-model so a dead 70B doesn't stop the 1.5B.
+- **Rate limiting** (`test_ratelimit.py`) — bursts allowed up to capacity; idle
+  time doesn't bank unlimited burst; rejected requests don't consume tokens (so
+  a retry loop can still recover); Lua atomicity under 50-way concurrency; fails
+  **open** on outage, deliberately the opposite of the ledger.
+- **Load shedding** (`test_resilience.py`) — a shed request **refunds its
+  reservation** and doesn't leak a capacity slot; `admission_timeout_s=0` really
+  means wait forever rather than reject instantly.
+- **Failover** — only server faults fail over; a pinned `force_model` is never
+  silently replaced; the response is billed at the price of the model that
+  actually served it.
+
+And the original suite: 
 
 - **Billing integrity** — mid-stream disconnect still bills; disconnect doesn't
   leak a capacity slot; provider crash bills only what was produced; failed calls

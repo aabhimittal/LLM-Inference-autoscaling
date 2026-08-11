@@ -149,6 +149,30 @@ class Settings:
     # False lets them through unmetered (availability over accuracy).
     redis_fail_closed: bool = True
 
+    # ---- Response cache ------------------------------------------------
+    # The cheapest token is the one never generated. "none" disables caching.
+    cache_backend: str = "memory"  # none | memory | redis
+    cache_ttl_s: float = 300.0
+    cache_max_entries: int = 1024
+
+    # ---- Admission control ---------------------------------------------
+    # Maximum time a request may sit in the queue before being rejected. Without
+    # a deadline, a saturated service accumulates requests whose clients have
+    # already given up, and spends GPU time answering nobody.
+    admission_timeout_s: float = 30.0
+
+    # ---- Rate limiting (requests, not dollars) -------------------------
+    rate_limit_enabled: bool = True
+    rate_limit_burst: float = 20.0        # bucket capacity
+    rate_limit_per_second: float = 5.0    # sustained rate
+
+    # ---- Circuit breaker -----------------------------------------------
+    breaker_failure_threshold: int = 5
+    breaker_recovery_timeout_s: float = 30.0
+    # On a server-side model failure, retry the request on a different model
+    # that still fits the tier and budget.
+    fallback_enabled: bool = True
+
     catalog: List[ModelSpec] = field(default_factory=lambda: list(DEFAULT_CATALOG))
 
     @classmethod
@@ -183,6 +207,16 @@ class Settings:
             ledger_backend=os.getenv("LLM_LEDGER", "memory"),
             redis_url=os.getenv("LLM_REDIS_URL", "redis://localhost:6379/0"),
             redis_fail_closed=_b("LLM_REDIS_FAIL_CLOSED", True),
+            cache_backend=os.getenv("LLM_CACHE", "memory"),
+            cache_ttl_s=_f("LLM_CACHE_TTL_S", 300.0),
+            cache_max_entries=_i("LLM_CACHE_MAX_ENTRIES", 1024),
+            admission_timeout_s=_f("LLM_ADMISSION_TIMEOUT_S", 30.0),
+            rate_limit_enabled=_b("LLM_RATE_LIMIT_ENABLED", True),
+            rate_limit_burst=_f("LLM_RATE_LIMIT_BURST", 20.0),
+            rate_limit_per_second=_f("LLM_RATE_LIMIT_PER_SECOND", 5.0),
+            breaker_failure_threshold=_i("LLM_BREAKER_THRESHOLD", 5),
+            breaker_recovery_timeout_s=_f("LLM_BREAKER_RECOVERY_S", 30.0),
+            fallback_enabled=_b("LLM_FALLBACK_ENABLED", True),
         )
 
     def catalog_by_name(self) -> Dict[str, ModelSpec]:

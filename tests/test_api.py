@@ -3,15 +3,30 @@ import json
 import pytest
 from fastapi.testclient import TestClient
 
+from app.breaker import CircuitOpenError
 from app.config import Settings
-from app.main import create_app
-from app.providers import MockProvider, ProviderUnavailableError
-from app.service import InferenceService
+from app.cost import LedgerUnavailableError, UserBudgetExceededError
+from app.main import _as_http, create_app
+from app.providers import (
+    MockProvider,
+    ProviderError,
+    ProviderTimeoutError,
+    ProviderUnavailableError,
+)
+from app.ratelimit import RateLimitExceededError, TokenBucketLimiter
+from app.router import (
+    BudgetExceededError,
+    ContextTooLargeError,
+    NoModelAvailableError,
+)
+from app.service import AdmissionTimeoutError, InferenceService
 
 
 @pytest.fixture
 def client():
-    svc = InferenceService(Settings())
+    # Cache and rate limits off by default here so each test exercises the path
+    # it is actually about; the suites below turn them on explicitly.
+    svc = InferenceService(Settings(cache_backend="none", rate_limit_enabled=False))
     with TestClient(create_app(svc)) as c:
         yield c
 
@@ -172,9 +187,105 @@ def test_stream_midflight_provider_error_emits_error_event():
 
 def test_provider_unavailable_maps_to_503():
     svc = InferenceService(
-        Settings(),
+        Settings(cache_backend="none", rate_limit_enabled=False, fallback_enabled=False),
         provider=MockProvider(raise_error=ProviderUnavailableError("vllm down")),
     )
     with TestClient(create_app(svc)) as c:
         r = c.post("/v1/infer", json={"prompt": "say hi", "user_id": "s7"})
         assert r.status_code == 503
+
+
+# ---- caching, shedding, throttling over HTTP -------------------------------
+
+
+def test_cache_hit_is_reported_and_free():
+    svc = InferenceService(Settings(cache_backend="memory", rate_limit_enabled=False))
+    with TestClient(create_app(svc)) as c:
+        first = c.post("/v1/infer", json={"prompt": "say hi", "user_id": "c1"}).json()
+        second = c.post("/v1/infer", json={"prompt": "say hi", "user_id": "c1"}).json()
+        assert first["cached"] is False
+        assert second["cached"] is True
+        assert second["cost_usd"] == 0.0
+
+
+def test_stream_cache_hit_replays_with_cached_flag():
+    svc = InferenceService(Settings(cache_backend="memory", rate_limit_enabled=False))
+    with TestClient(create_app(svc)) as c:
+        c.post("/v1/infer/stream", json={"prompt": "say hi", "user_id": "c2"})
+        r = c.post("/v1/infer/stream", json={"prompt": "say hi", "user_id": "c2"})
+        events = _events(r)
+        assert events[0]["cached"] is True
+        assert [e for e in events if e["type"] == "end"][0]["cost_usd"] == 0.0
+
+
+def test_rate_limited_request_returns_429_with_retry_after():
+    """A blind retry storm is what turns throttling into an outage. Retry-After
+    turns it into coordinated backoff."""
+    svc = InferenceService(
+        Settings(cache_backend="none"),
+        rate_limiter=TokenBucketLimiter(capacity=1.0, refill_per_second=1.0),
+    )
+    with TestClient(create_app(svc)) as c:
+        assert c.post("/v1/infer", json={"prompt": "a", "user_id": "r1"}).status_code == 200
+        r = c.post("/v1/infer", json={"prompt": "b", "user_id": "r1"})
+        assert r.status_code == 429
+        assert int(r.headers["retry-after"]) >= 1
+
+
+@pytest.mark.parametrize(
+    "exc,expected",
+    [
+        (BudgetExceededError(1.0, 0.5), 402),
+        (UserBudgetExceededError("u", 1.0, 1.0, 1.0), 429),
+        (RateLimitExceededError("u", 2.0), 429),
+        (ContextTooLargeError("too big"), 413),
+        (LedgerUnavailableError("redis down"), 503),
+        (AdmissionTimeoutError(30.0), 503),
+        (CircuitOpenError("small", 12.0), 503),
+        (NoModelAvailableError("all excluded"), 503),
+        (ProviderTimeoutError("slow"), 504),
+        (ProviderUnavailableError("down"), 503),
+        (ProviderError("garbage"), 502),
+        (ValueError("bad model"), 400),
+    ],
+)
+def test_every_domain_error_maps_to_a_status(exc, expected):
+    """The map is order-sensitive (subclasses must precede their base), so it is
+    worth asserting exhaustively rather than trusting the ordering by eye."""
+    assert _as_http(exc).status_code == expected
+
+
+def test_retry_after_is_set_for_throttling_errors():
+    assert _as_http(RateLimitExceededError("u", 2.0)).headers["retry-after"] == "3"
+    assert _as_http(CircuitOpenError("small", 12.0)).headers["retry-after"] == "13"
+
+
+def test_retry_after_is_omitted_when_unbounded():
+    """An infinite retry delay must not render as a nonsense header value."""
+    assert _as_http(RateLimitExceededError("u", float("inf"))).headers is None
+
+
+def test_status_endpoint_reports_operational_state():
+    svc = InferenceService(Settings(cache_backend="memory", rate_limit_enabled=False))
+    with TestClient(create_app(svc)) as c:
+        c.post("/v1/infer", json={"prompt": "say hi", "user_id": "st1"})
+        c.post("/v1/infer", json={"prompt": "say hi", "user_id": "st1"})
+        body = c.get("/v1/status").json()
+        assert body["cache_hit_rate"] > 0
+        assert body["replicas"] >= 1
+        assert body["open_circuits"] == []
+
+
+def test_metrics_include_cache_and_shedding_counters():
+    svc = InferenceService(Settings(cache_backend="memory", rate_limit_enabled=False))
+    with TestClient(create_app(svc)) as c:
+        c.post("/v1/infer", json={"prompt": "say hi", "user_id": "m1"})
+        text = c.get("/metrics").text
+        for name in (
+            "llm_total_cache_hits",
+            "llm_total_cache_misses",
+            "llm_total_shed",
+            "llm_total_rate_limited",
+            "llm_total_failovers",
+        ):
+            assert name in text
