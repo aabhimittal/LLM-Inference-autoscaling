@@ -14,7 +14,7 @@ complexity" actually happens:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Set
 
 from .complexity import ComplexityResult, estimate_complexity
 from .config import Complexity, ModelSpec, Settings
@@ -35,6 +35,10 @@ class BudgetExceededError(Exception):
 
 class ContextTooLargeError(Exception):
     """Raised when the prompt exceeds every model's context window."""
+
+
+class NoModelAvailableError(Exception):
+    """Every candidate model was excluded — e.g. all their circuits are open."""
 
 
 @dataclass
@@ -70,11 +74,17 @@ def route(
     max_output_tokens: Optional[int] = None,
     budget_usd: Optional[float] = None,
     force_model: Optional[str] = None,
+    exclude: Optional[Set[str]] = None,
 ) -> RoutingDecision:
     """Choose a model for ``prompt`` under the given budget.
 
     ``force_model`` bypasses complexity routing (but still runs the budget and
     context checks) so callers can pin a model when they need to.
+
+    ``exclude`` removes model names from consideration. The service uses it for
+    failover: when a backend errors or its circuit is open, it re-routes with
+    that model excluded, which naturally yields the next-best affordable choice
+    instead of duplicating the selection logic.
     """
     notes: List[str] = []
     budget = budget_usd if budget_usd is not None else settings.default_request_budget_usd
@@ -91,7 +101,11 @@ def route(
         max_output_tokens, settings.default_max_output_tokens
     )
 
-    catalog = settings.catalog
+    catalog = [m for m in settings.catalog if m.name not in (exclude or set())]
+    if not catalog:
+        raise NoModelAvailableError(
+            f"every model is excluded ({sorted(exclude or [])})"
+        )
 
     # Forced model path: honor the caller's choice but still validate it.
     if force_model:

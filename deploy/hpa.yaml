@@ -1,7 +1,10 @@
-# Example Kubernetes Horizontal Pod Autoscaler driven by the queue-depth metric
-# the service exports at /metrics. This is the *external* counterpart to the
-# in-process autoscaler: the app resizes its own concurrency gate, while the HPA
-# adds/removes pods based on the same load signal scraped by Prometheus.
+# Kubernetes Deployment + HPA driven by the queue-depth metric the service
+# exports at /metrics. This is the *external* counterpart to the in-process
+# autoscaler: the app resizes its own concurrency gate, while the HPA adds and
+# removes pods based on the same load signal scraped by Prometheus.
+#
+# With LLM_LEDGER=redis every pod shares one budget, so scaling out does not
+# multiply each user's spending limit by the replica count.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -20,6 +23,9 @@ spec:
         prometheus.io/port: "8000"
         prometheus.io/path: "/metrics"
     spec:
+      # Give in-flight generations time to drain before the pod dies; streaming
+      # requests can legitimately run for a minute or more.
+      terminationGracePeriodSeconds: 120
       containers:
         - name: llm-inference
           image: llm-inference-autoscaling:latest
@@ -32,10 +38,31 @@ spec:
               value: "20"
             - name: LLM_TARGET_CONCURRENCY
               value: "4"
-          readinessProbe:
+            - name: LLM_LEDGER
+              value: "redis"
+            - name: LLM_REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: llm-inference-redis
+                  key: url
+            - name: LLM_PROVIDER
+              value: "vllm"
+            - name: LLM_VLLM_BASE_URL
+              value: "http://vllm.default.svc.cluster.local:8000"
+          # Liveness only checks the process; readiness also checks the cost
+          # store, so a pod that cannot enforce budgets leaves the rotation
+          # instead of rejecting every request it receives.
+          livenessProbe:
             httpGet:
               path: /healthz
               port: 8000
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8000
+            periodSeconds: 5
+            failureThreshold: 3
           resources:
             requests:
               cpu: "500m"
@@ -57,7 +84,8 @@ spec:
   maxReplicas: 20
   metrics:
     # Scale on the custom queue-depth gauge (requires prometheus-adapter to
-    # surface llm_queue_depth as a pods metric).
+    # surface llm_queue_depth as a pods metric). Queue depth, not CPU: an LLM
+    # pod waiting on a GPU is not CPU-busy, so CPU-based scaling under-reacts.
     - type: Pods
       pods:
         metric:
@@ -73,8 +101,20 @@ spec:
           value: 100
           periodSeconds: 15
     scaleDown:
-      stabilizationWindowSeconds: 60
+      # Slow scale-down matches the in-process cooldown and avoids paying the
+      # model-load cold start repeatedly during choppy traffic.
+      stabilizationWindowSeconds: 300
       policies:
         - type: Pods
           value: 1
-          periodSeconds: 30
+          periodSeconds: 60
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: llm-inference
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: llm-inference

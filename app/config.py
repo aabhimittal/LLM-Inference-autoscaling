@@ -9,7 +9,25 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import Dict, List
+from typing import Dict, List, Optional
+
+
+def _parse_model_map(raw: str) -> Dict[str, str]:
+    """Parse ``"small=org/model-a,large=org/model-b"`` into a dict.
+
+    Malformed entries are skipped rather than raising, so one bad pair in an
+    env var cannot prevent the process from starting.
+    """
+    out: Dict[str, str] = {}
+    for pair in (raw or "").split(","):
+        pair = pair.strip()
+        if not pair or "=" not in pair:
+            continue
+        key, _, value = pair.partition("=")
+        key, value = key.strip(), value.strip()
+        if key and value:
+            out[key] = value
+    return out
 
 
 class Complexity(IntEnum):
@@ -112,6 +130,49 @@ class Settings:
     chars_per_token: float = 4.0
     default_max_output_tokens: int = 512
 
+    # ---- Backends ------------------------------------------------------
+    # "mock" runs fully offline; "vllm" talks to a vLLM OpenAI-compatible server.
+    provider_backend: str = "mock"
+    vllm_base_url: str = "http://localhost:8000"
+    vllm_api_key: Optional[str] = None
+    # Maps catalog names -> the model IDs the vLLM server was launched with,
+    # e.g. "small=Qwen/Qwen2.5-1.5B-Instruct,large=meta-llama/Llama-3.1-70B".
+    vllm_model_map: Dict[str, str] = field(default_factory=dict)
+    vllm_read_timeout_s: float = 120.0
+    vllm_connect_timeout_s: float = 5.0
+    vllm_max_retries: int = 3
+
+    # "memory" enforces budgets per process; "redis" enforces them fleet-wide.
+    ledger_backend: str = "memory"
+    redis_url: str = "redis://localhost:6379/0"
+    # On a Redis outage: True rejects requests (spend stays controlled),
+    # False lets them through unmetered (availability over accuracy).
+    redis_fail_closed: bool = True
+
+    # ---- Response cache ------------------------------------------------
+    # The cheapest token is the one never generated. "none" disables caching.
+    cache_backend: str = "memory"  # none | memory | redis
+    cache_ttl_s: float = 300.0
+    cache_max_entries: int = 1024
+
+    # ---- Admission control ---------------------------------------------
+    # Maximum time a request may sit in the queue before being rejected. Without
+    # a deadline, a saturated service accumulates requests whose clients have
+    # already given up, and spends GPU time answering nobody.
+    admission_timeout_s: float = 30.0
+
+    # ---- Rate limiting (requests, not dollars) -------------------------
+    rate_limit_enabled: bool = True
+    rate_limit_burst: float = 20.0        # bucket capacity
+    rate_limit_per_second: float = 5.0    # sustained rate
+
+    # ---- Circuit breaker -----------------------------------------------
+    breaker_failure_threshold: int = 5
+    breaker_recovery_timeout_s: float = 30.0
+    # On a server-side model failure, retry the request on a different model
+    # that still fits the tier and budget.
+    fallback_enabled: bool = True
+
     catalog: List[ModelSpec] = field(default_factory=lambda: list(DEFAULT_CATALOG))
 
     @classmethod
@@ -122,6 +183,12 @@ class Settings:
         def _i(key: str, default: int) -> int:
             return int(os.getenv(key, default))
 
+        def _b(key: str, default: bool) -> bool:
+            raw = os.getenv(key)
+            if raw is None:
+                return default
+            return raw.strip().lower() in {"1", "true", "yes", "on"}
+
         return cls(
             default_request_budget_usd=_f("LLM_REQUEST_BUDGET_USD", 0.50),
             default_user_daily_budget_usd=_f("LLM_USER_DAILY_BUDGET_USD", 25.0),
@@ -130,6 +197,26 @@ class Settings:
             target_concurrency_per_replica=_f("LLM_TARGET_CONCURRENCY", 4.0),
             scale_down_cooldown_s=_f("LLM_SCALE_DOWN_COOLDOWN_S", 60.0),
             scale_up_cooldown_s=_f("LLM_SCALE_UP_COOLDOWN_S", 10.0),
+            provider_backend=os.getenv("LLM_PROVIDER", "mock"),
+            vllm_base_url=os.getenv("LLM_VLLM_BASE_URL", "http://localhost:8000"),
+            vllm_api_key=os.getenv("LLM_VLLM_API_KEY"),
+            vllm_model_map=_parse_model_map(os.getenv("LLM_VLLM_MODEL_MAP", "")),
+            vllm_read_timeout_s=_f("LLM_VLLM_READ_TIMEOUT_S", 120.0),
+            vllm_connect_timeout_s=_f("LLM_VLLM_CONNECT_TIMEOUT_S", 5.0),
+            vllm_max_retries=_i("LLM_VLLM_MAX_RETRIES", 3),
+            ledger_backend=os.getenv("LLM_LEDGER", "memory"),
+            redis_url=os.getenv("LLM_REDIS_URL", "redis://localhost:6379/0"),
+            redis_fail_closed=_b("LLM_REDIS_FAIL_CLOSED", True),
+            cache_backend=os.getenv("LLM_CACHE", "memory"),
+            cache_ttl_s=_f("LLM_CACHE_TTL_S", 300.0),
+            cache_max_entries=_i("LLM_CACHE_MAX_ENTRIES", 1024),
+            admission_timeout_s=_f("LLM_ADMISSION_TIMEOUT_S", 30.0),
+            rate_limit_enabled=_b("LLM_RATE_LIMIT_ENABLED", True),
+            rate_limit_burst=_f("LLM_RATE_LIMIT_BURST", 20.0),
+            rate_limit_per_second=_f("LLM_RATE_LIMIT_PER_SECOND", 5.0),
+            breaker_failure_threshold=_i("LLM_BREAKER_THRESHOLD", 5),
+            breaker_recovery_timeout_s=_f("LLM_BREAKER_RECOVERY_S", 30.0),
+            fallback_enabled=_b("LLM_FALLBACK_ENABLED", True),
         )
 
     def catalog_by_name(self) -> Dict[str, ModelSpec]:

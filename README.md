@@ -8,8 +8,12 @@ cheap model; only genuinely hard prompts pay for the large one — and if a
 request's projected token cost would blow its budget, the router automatically
 switches it down to a model that fits.
 
-Runs end to end with **no API keys** thanks to a deterministic mock provider, so
-you can try the whole pipeline — routing, budgeting, autoscaling — offline.
+Backed by **vLLM** for real inference, **Redis** for fleet-wide budget
+enforcement, **SSE streaming** that still bills correctly when a client
+disconnects mid-generation, and a **response cache**, **circuit breaker**,
+**rate limiter**, and **load shedding** for production hardening. Runs end to
+end with **no API keys or GPU** thanks to a deterministic mock provider, so you
+can try the whole pipeline offline.
 
 > New here? Read **[docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md)** for a
 > step-by-step, module-by-module build of the whole system.
@@ -20,34 +24,46 @@ you can try the whole pipeline — routing, budgeting, autoscaling — offline.
 
 Serving every request on your best model is simple and ruinously expensive. Most
 production LLM traffic is easy (classification, short answers, formatting) and
-does not need a frontier model. This service adds three things a raw model
-endpoint lacks:
+does not need a frontier model. This service adds what a raw model endpoint
+lacks:
 
 1. **Complexity-based model switching** — a cheap, explainable classifier scores
    each prompt and routes it to the smallest capable model.
 2. **Cost controls** — projected token cost is checked against a per-request
-   budget (switching models to fit) and against a rolling per-user daily budget
-   (reserve-then-settle, so concurrent requests can't overspend).
-3. **Autoscaling** — an in-process concurrency controller for bursts, plus a
-   `/metrics` signal for a Kubernetes HPA to scale pods for sustained load.
+   budget (switching models to fit) and against a rolling per-user daily budget.
+   The Redis ledger makes that budget **global across replicas** — the in-memory
+   version silently gives each user N× their limit once you scale out.
+3. **Autoscaling** — a resizable in-process concurrency gate for bursts, plus a
+   `/metrics` queue-depth signal for a Kubernetes HPA to scale pods.
+4. **Streaming that bills honestly** — a client who disconnects halfway through
+   is still charged for the tokens the GPU actually produced.
+5. **A response cache** — identical prompts are served for **$0** without
+   touching a GPU, with stampede protection so an expired hot key doesn't
+   thunder.
+6. **Resilience** — per-model circuit breakers with failover, token-bucket rate
+   limiting, and admission deadlines that shed rather than queue forever.
 
 ## Architecture
 
 ```
                        ┌─────────────────────────────────────────────┐
   POST /v1/infer  ───► │  complexity ─► router ─► ledger ─► provider  │ ─► response
-                       │      (1)        (2)+(3)    (4)       (5)      │
-                       └─────────────────────────────────────────────┘
+  POST /v1/infer/      │      (1)        (2)+(3)    (4)       (5)      │ ─► SSE stream
+       stream          └─────────────────────────────────────────────┘
                                      │ load metrics
                                      ▼
-                             autoscaler (6) ──► replica target ──► /metrics ──► HPA
+                       gate (6) ─► autoscaler (7) ─► /metrics ─► HPA
 
-  (1) app/complexity.py   score task difficulty (no model call)
-  (2) app/router.py       pick cheapest capable model
-  (3) app/router.py       token/cost budget check -> switch model down if needed
-  (4) app/cost.py         reserve against user daily budget, settle on real usage
-  (5) app/providers.py    run the model (mock by default; pluggable)
-  (6) app/autoscaler.py   ceil(load / target) with fast-up / slow-down cooldowns
+  (0) app/ratelimit.py     token bucket; cheapest possible rejection
+  (1) app/complexity.py    score task difficulty (no model call)
+  (2) app/router.py        pick cheapest capable model
+  (3) app/router.py        token/cost budget check -> switch model down if needed
+  (3b) app/cache.py        cache hit? return for $0, skipping 4-6 entirely
+  (4) app/cost/            reserve -> settle; memory (1 node) or Redis (fleet)
+  (5) app/providers/       mock (offline) or vLLM; buffered or streamed
+       app/breaker.py      per-model circuit breaker + failover to another model
+  (6) app/gate.py          admission control + deadline; wait queue is the signal
+  (7) app/autoscaler.py    ceil(load / target) with fast-up / slow-down cooldowns
 ```
 
 ## Quickstart
@@ -84,6 +100,10 @@ curl -s localhost:8000/v1/infer -H 'content-type: application/json' \
 # Dry-run: see the routing decision and projected cost WITHOUT spending
 curl -s localhost:8000/v1/route/explain -H 'content-type: application/json' \
   -d '{"prompt":"summarize this","user_id":"alice"}'
+
+# Stream tokens as they are generated (SSE)
+curl -N localhost:8000/v1/infer/stream -H 'content-type: application/json' \
+  -d '{"prompt":"say hi","user_id":"alice"}'
 ```
 
 ## API
@@ -91,19 +111,30 @@ curl -s localhost:8000/v1/route/explain -H 'content-type: application/json' \
 | Method & path | Description |
 |---|---|
 | `POST /v1/infer` | Run inference: classify → route → budget-check → generate. |
+| `POST /v1/infer/stream` | Same, streamed as Server-Sent Events. |
 | `POST /v1/route/explain` | Dry-run the routing decision (no spend, no model call). |
 | `GET /v1/models` | Model catalog with pricing and tiers. |
 | `GET /v1/usage` | Per-user spend summary. |
 | `GET /metrics` | Prometheus metrics (in-flight, queue depth, tokens, cost). |
 | `GET /healthz` | Liveness + current replica count. |
+| `GET /readyz` | Readiness — verifies the cost store is reachable. |
+| `GET /v1/status` | Operational snapshot: capacity, cache hit rate, open circuits, shed/throttle counts. |
 
-**Request fields** (`POST /v1/infer`): `prompt` (required), `user_id`,
-`task_type` (`simple|moderate|complex` — overrides the classifier),
-`max_output_tokens`, `budget_usd` (per-request; triggers model switching),
-`user_daily_budget_usd`, `force_model`.
+**Request fields**: `prompt` (required), `user_id`, `task_type`
+(`simple|moderate|complex` — overrides the classifier), `max_output_tokens`,
+`budget_usd` (per-request; triggers model switching), `user_daily_budget_usd`,
+`force_model`.
+
+**Stream events** are SSE frames: `start` (model, complexity, whether it was
+downgraded), repeated `delta` (`text`), then `end` (final tokens + `cost_usd`),
+terminated by `[DONE]`. Admission failures arrive as a normal HTTP status
+*before* the stream opens, never buried inside a `200`.
 
 **Error codes:** `402` request budget can't be met · `429` user daily budget
-exhausted · `413` prompt exceeds every context window · `400` bad input.
+exhausted · `413` prompt exceeds every context window · `400` bad input ·
+`502/503/504` upstream model server unusable/unreachable/too slow · `503` cost
+store unreachable while fail-closed, request shed, or circuit open. Throttling
+and circuit responses carry `Retry-After`.
 
 ## Model catalog
 
@@ -127,33 +158,116 @@ All via environment variables (see `app/config.py`):
 | `LLM_MIN_REPLICAS` / `LLM_MAX_REPLICAS` | `1` / `20` | Autoscaler bounds. |
 | `LLM_TARGET_CONCURRENCY` | `4` | In-flight requests one replica handles. |
 | `LLM_SCALE_UP_COOLDOWN_S` / `LLM_SCALE_DOWN_COOLDOWN_S` | `10` / `60` | Anti-flap cooldowns. |
+| `LLM_PROVIDER` | `mock` | `mock` (offline) or `vllm`. |
+| `LLM_VLLM_BASE_URL` | `http://localhost:8000` | vLLM server address. |
+| `LLM_VLLM_MODEL_MAP` | — | `small=org/model-a,large=org/model-b`. |
+| `LLM_VLLM_MAX_RETRIES` | `3` | Retries on 429/5xx/connect errors. |
+| `LLM_LEDGER` | `memory` | `memory` (per process) or `redis` (fleet-wide). |
+| `LLM_REDIS_URL` | `redis://localhost:6379/0` | Ledger store. |
+| `LLM_REDIS_FAIL_CLOSED` | `true` | On Redis outage: reject (`true`) or serve unmetered (`false`). |
+| `LLM_CACHE` | `memory` | `none`, `memory`, or `redis` (shared across replicas). |
+| `LLM_CACHE_TTL_S` | `300` | Cached response lifetime. |
+| `LLM_ADMISSION_TIMEOUT_S` | `30` | Max queue wait before shedding (`0` = wait forever). |
+| `LLM_RATE_LIMIT_ENABLED` | `true` | Per-user token-bucket throttling. |
+| `LLM_RATE_LIMIT_BURST` / `LLM_RATE_LIMIT_PER_SECOND` | `20` / `5` | Bucket capacity and sustained rate. |
+| `LLM_BREAKER_THRESHOLD` / `LLM_BREAKER_RECOVERY_S` | `5` / `30` | Consecutive faults to open a circuit, and the probe delay. |
+| `LLM_FALLBACK_ENABLED` | `true` | Retry on another model when a backend is sick. |
+
+### Using vLLM
+
+```bash
+vllm serve Qwen/Qwen2.5-1.5B-Instruct --port 8001   # your model server
+
+LLM_PROVIDER=vllm \
+LLM_VLLM_BASE_URL=http://localhost:8001 \
+LLM_VLLM_MODEL_MAP="small=Qwen/Qwen2.5-1.5B-Instruct" \
+LLM_LEDGER=redis \
+uvicorn app.main:app
+```
+
+The adapter uses vLLM's OpenAI-compatible `/v1/completions`, prefers the
+server's reported token counts for billing, retries 429/5xx with backoff, and
+never retries a `4xx` (that's our bug, and retrying amplifies load).
 
 ## Deployment
 
 ```bash
-docker compose up --build            # local container
-kubectl apply -f deploy/hpa.yaml     # Deployment + HPA scaling on llm_queue_depth
+docker compose up --build            # app + Redis
+docker compose --profile gpu up      # ...plus a real vLLM server (needs a GPU)
+kubectl apply -f deploy/hpa.yaml     # Deployment + HPA + PodDisruptionBudget
 ```
 
-The service scales in two layers: an **in-process concurrency gate** absorbs
-bursts instantly, while the **HPA** adds pods for sustained load — both driven by
-the same queue-depth signal so they never fight.
+The service scales in two layers: the **in-process capacity gate** absorbs bursts
+instantly, while the **HPA** adds pods for sustained load — both driven by the
+same queue-depth signal so they never fight. Scale on queue depth, not CPU: a pod
+blocked on a GPU isn't CPU-busy, so CPU-based scaling under-reacts exactly when
+you need it most.
 
 ## Project layout
 
 ```
-app/         complexity, router, cost, autoscaler, providers, metrics, service, main
-tests/       one suite per component + service/api integration tests
+app/
+  complexity.py router.py         routing + token/cost budget switch
+  cost/                           memory + Redis ledgers (reserve/settle/release)
+  providers/                      mock + vLLM (buffered and streaming)
+  gate.py autoscaler.py metrics.py
+  service.py factory.py main.py
+tests/       per-component suites + edge-case, vLLM, and Redis suites
 examples/    demo.py — offline end-to-end run
-deploy/      Kubernetes Deployment + HPA
+deploy/      Kubernetes Deployment + HPA + PDB
 docs/        IMPLEMENTATION.md — step-by-step build guide
 ```
 
 ## Testing
 
 ```bash
-pytest -q      # 34 tests: complexity, routing, cost ledger, autoscaler, service, API
+pytest -q      # 198 tests
 ```
+
+Beyond per-component coverage, the edge-case suites target the failure modes
+that cost real money or wake people up:
+
+- **Caching** (`test_cache.py`, `test_resilience.py`) — the key covers model and
+  output ceiling, so a cheap model's answer is never served to a request that
+  paid for the expensive one; TTL and LRU bounds; failed and **truncated**
+  generations are never cached; ten concurrent misses collapse to one
+  generation; a follower disconnecting doesn't cancel the shared work; a
+  poisoned Redis entry degrades to a miss instead of serving garbage.
+- **Circuit breaking** (`test_breaker.py`) — client errors never trip the
+  breaker (one bad prompt must not evict a healthy backend); HALF_OPEN admits
+  exactly one probe; a failed probe restarts the full timer; breakers are
+  per-model so a dead 70B doesn't stop the 1.5B.
+- **Rate limiting** (`test_ratelimit.py`) — bursts allowed up to capacity; idle
+  time doesn't bank unlimited burst; rejected requests don't consume tokens (so
+  a retry loop can still recover); Lua atomicity under 50-way concurrency; fails
+  **open** on outage, deliberately the opposite of the ledger.
+- **Load shedding** (`test_resilience.py`) — a shed request **refunds its
+  reservation** and doesn't leak a capacity slot; `admission_timeout_s=0` really
+  means wait forever rather than reject instantly.
+- **Failover** — only server faults fail over; a pinned `force_model` is never
+  silently replaced; the response is billed at the price of the model that
+  actually served it.
+
+And the original suite: 
+
+- **Billing integrity** — mid-stream disconnect still bills; disconnect doesn't
+  leak a capacity slot; provider crash bills only what was produced; failed calls
+  refund; `settle` is idempotent; 50 concurrent reservations against a `$1.00`
+  cap grant exactly 10.
+- **Hostile input** — empty/whitespace/null-byte prompts; emoji and CJK never
+  yield a zero token count (a zero count is a free request); oversized context;
+  zero/negative budgets; single-model catalogs with nowhere to downgrade.
+- **vLLM transport** — 429 retry, give-up after max retries, `4xx` never
+  retried, timeouts vs refused connections, malformed SSE frames, missing
+  `usage`.
+- **Redis** — real Lua executed via `fakeredis`: atomicity under 50-way
+  concurrency, shared budgets across instances, fail-closed vs fail-open,
+  `NOSCRIPT` recovery after a restart, corrupt-member tolerance.
+- **Capacity & scaling** — graceful shrink without interrupting in-flight work,
+  waiters woken on grow, no flapping on spikes, `min > max` misconfiguration.
+
+The two disconnect-billing tests are mutation-checked: deleting the finalizer
+makes them fail.
 
 ## License
 

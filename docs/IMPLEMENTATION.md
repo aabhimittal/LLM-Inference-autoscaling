@@ -29,19 +29,30 @@ The request lifecycle these steps assemble:
 
 ```
 app/
-  config.py       model catalog + pricing + settings   (source of truth)
-  tokens.py       token estimation (tiktoken or heuristic)
-  complexity.py   task-complexity classifier
-  router.py       model selection + token/cost budget switch
-  cost.py         per-user spend ledger (reserve / settle / release)
-  providers.py    provider interface + deterministic mock
-  autoscaler.py   replica-count control loop
-  metrics.py      in-memory counters + Prometheus export
-  service.py      orchestration: wires 1–8 together
-  main.py         FastAPI HTTP surface
-tests/            one test module per component
-examples/demo.py  runnable, no API keys
-deploy/hpa.yaml   Kubernetes HPA driven by the exported metrics
+  config.py            model catalog + pricing + settings  (source of truth)
+  tokens.py            token estimation (tiktoken or heuristic)
+  complexity.py        task-complexity classifier
+  router.py            model selection + token/cost budget switch
+  cost/
+    base.py            ledger protocol: reserve / settle / release
+    memory.py          in-process ledger (single node, tests)
+    redis_ledger.py    distributed ledger, atomic via Lua
+  providers/
+    base.py            Provider protocol, Completion, StreamChunk
+    mock.py            deterministic offline provider (+ failure injection)
+    vllm.py            vLLM OpenAI-compatible adapter, buffered + streaming
+  cache.py             response cache (memory/Redis) + single-flight
+  breaker.py           circuit breaker per backend + registry
+  ratelimit.py         token-bucket rate limiter (memory/Redis)
+  gate.py              resizable concurrency gate (admission control)
+  autoscaler.py        replica-count control loop
+  metrics.py           in-memory counters + Prometheus export
+  service.py           orchestration: buffered + streaming paths
+  factory.py           builds the service from Settings
+  main.py              FastAPI HTTP surface
+tests/                 one module per component + edge-case suites
+examples/demo.py       runnable, no API keys
+deploy/hpa.yaml        Deployment + HPA + PodDisruptionBudget
 ```
 
 Design rule: each module does one thing and depends only on `config` and the
@@ -154,7 +165,7 @@ downgrades, or read the flag and retry.
 
 ---
 
-## Step 5 — Cost controls: the spend ledger (`cost.py`)
+## Step 5 — Cost controls: the spend ledger (`cost/memory.py`)
 
 Routing decides what a request *would* cost; the ledger decides whether the user
 is *allowed* to spend it. It enforces a **rolling daily budget per user** with a
@@ -178,7 +189,7 @@ overspend. Reserving first makes the check-and-charge atomic.
 
 ---
 
-## Step 6 — Provider abstraction (`providers.py`)
+## Step 6 — Provider abstraction (`providers/base.py`)
 
 The rest of the system talks to one `Provider` protocol with a single
 `generate()` method, so no business logic depends on a specific vendor. A
@@ -259,28 +270,303 @@ and for testing routing policy.
 
 ---
 
-## Step 10 — Verifying it
+## Step 10 — Real inference with vLLM (`providers/vllm.py`)
+
+`VLLMProvider` talks to a vLLM server through its OpenAI-compatible API
+(`/v1/completions`), which is what `vllm serve <model>` exposes. Switching to it
+is configuration, not code: `LLM_PROVIDER=vllm`.
+
+`model_map` translates catalog names into the model IDs the server was launched
+with:
+
+```bash
+LLM_PROVIDER=vllm
+LLM_VLLM_BASE_URL=http://vllm:8000
+LLM_VLLM_MODEL_MAP="small=Qwen/Qwen2.5-1.5B-Instruct,large=Qwen/Qwen2.5-32B-Instruct"
+```
+
+Four production concerns are handled inside the adapter:
+
+| Concern | Handling | Why |
+|---|---|---|
+| Slow vs dead server | separate connect (5s) and read (120s) timeouts | a dead server should fail fast; a long generation is legitimate |
+| Transient faults | retry with exponential backoff on connect errors, 429, 5xx | vLLM returns 429 when its scheduler queue is full |
+| Client errors | **never** retried (400 → immediate raise) | retrying our own bug amplifies load during an incident |
+| Billing accuracy | prefer server-reported `usage` over local estimates | the server's tokenizer is authoritative; fall back to estimation only if `usage` is absent |
+
+Mid-stream failures are deliberately *not* retried: bytes already reached the
+client, so a restart would duplicate output. The failure propagates and the
+service bills for the partial generation.
+
+---
+
+## Step 11 — Distributed budgets with Redis (`cost/redis_ledger.py`)
+
+The in-memory ledger enforces budgets **per process**. Run four replicas and
+each user effectively gets 4× their budget — the single most common way a cost
+control silently stops working once you scale out.
+
+`RedisLedger` makes the budget global. The critical detail is **atomicity**:
+
+```
+ZSET  llm:spend:{user}   member "{entry_id}:{amount}"   score = unix_ts
+HASH  llm:usage:{user}   field  "total" -> lifetime settled spend
+```
+
+A read-then-write from Python has a race window where N replicas all read the
+same balance and all conclude there is room. So prune → sum → compare → write
+happens inside a **Lua script**, which Redis executes atomically:
+
+```lua
+redis.call('ZREMRANGEBYSCORE', key, '-inf', now - window)  -- roll the window
+-- sum live spend from members
+if total + amount > limit then return {0, tostring(total)} end
+redis.call('ZADD', key, now, member)                        -- take the hold
+```
+
+The test suite proves this: 50 concurrent `$0.10` reservations against a `$1.00`
+cap grant **exactly 10**.
+
+Three operational details worth knowing:
+
+- **NOSCRIPT recovery** — the cached script SHA dies with a Redis restart, so
+  `EVALSHA` failures transparently fall back to `EVAL` and reload.
+- **`fail_closed` policy** — when Redis is unreachable, do we reject (protect
+  spend) or allow (protect availability)? Default is **fail-closed**: a
+  cost-control outage must not become an unmetered-spend incident. Flip it with
+  `LLM_REDIS_FAIL_CLOSED=false` if availability genuinely outranks accuracy.
+- **Corrupt members are skipped**, not fatal — one bad entry from an old schema
+  must not break billing for an entire user.
+
+`/readyz` checks the ledger, so a pod that cannot enforce budgets leaves the
+load-balancer rotation rather than rejecting every request it receives.
+
+---
+
+## Step 12 — Streaming, and the money it can leak
+
+Streaming is where cost control gets genuinely hard. The naive implementation
+bills on clean completion — which means **any client can stream and then
+disconnect to get the generation free**. The tokens were still produced; the GPU
+time was still spent.
+
+The provider interface therefore gains `generate_stream()`, yielding
+`StreamChunk`s with `usage` on the terminal chunk. `InferenceService.handle_stream()`
+has three termination paths, and all three must settle:
+
+| Path | Billing |
+|---|---|
+| normal completion | provider-reported usage |
+| provider error mid-stream | partial output, `error` event, exception propagates |
+| **client disconnect** | partial output, reconstructed from accumulated text |
+
+The subtle part is *how* cleanup runs. A disconnect closes the async generator
+at its `yield`, and if the request task is being cancelled, any `await` in the
+generator's `finally` is cancelled too — losing the billing write. So
+finalization is dispatched to a **detached task**:
+
+```python
+finally:
+    finalize()          # synchronous: schedules the work, never awaits
+
+def _finalize_later(...):
+    task = asyncio.create_task(_run())   # outside the request's cancel scope
+    self._pending.add(task)              # keep a strong ref; asyncio does not
+    task.add_done_callback(self._pending.discard)
+```
+
+`drain_settlements()` awaits those tasks — used at shutdown and in tests. Both
+disconnect tests were mutation-checked: removing `finalize()` makes them fail.
+
+On the HTTP side, `/v1/infer/stream` pulls the **first event eagerly** before
+returning a `StreamingResponse`. That event is produced after routing and budget
+admission, so a rejected request still gets a real `402`/`429` instead of a
+`200` with an error buried in the body — clients key retries off status codes.
+
+---
+
+## Step 13 — A capacity gate that can shrink (`gate.py`)
+
+`asyncio.Semaphore` can grow (release extra permits) but cannot shrink: taking
+permits back means acquiring them, which blocks. The autoscaler needs both
+directions, so `CapacityGate` tracks capacity explicitly behind a condition
+variable.
+
+Shrinking is **graceful** — in-flight generations are never interrupted; the gate
+simply stops admitting new work until `active` drops below the new capacity. The
+gate also owns the `waiting` counter, which *is* the queue-depth signal the
+autoscaler scales on.
+
+> Scale on queue depth, not CPU. A pod blocked on a GPU is not CPU-busy, so
+> CPU-based scaling under-reacts exactly when you need it most.
+
+---
+
+## Step 14 — Response caching (`cache.py`)
+
+The cheapest token is the one never generated. Identical prompts are extremely
+common in production — retries, shared prompt templates, polling clients,
+evaluation loops — and a hit costs **$0** and returns in microseconds.
+
+Two things make the cache *correct* rather than merely fast:
+
+**The key must cover everything that changes the output.** Keying on the prompt
+alone will serve a `small`-model answer to a request that paid for `large`, or a
+50-token answer to one that asked for 2000. So the key is
+`sha256(version, model, prompt, max_output_tokens)`. The version prefix means a
+behaviour change can invalidate everything by bumping one constant.
+
+**Stampede protection.** When a hot key expires under load, N concurrent
+identical requests all miss and all call the model. `SingleFlight` collapses
+them into one generation that everybody shares. Followers use `asyncio.shield`,
+so a follower giving up cannot cancel the work the others are waiting on.
+
+Three deliberate policy choices, each of which is tested:
+
+| Choice | Reasoning |
+|---|---|
+| Hits **bypass the budget** and cost $0 | No tokens were generated; charging for them would defeat the purpose |
+| Hits **bypass the capacity gate** | A cache that exists to shed load must not itself be limited by that load |
+| Failed and **truncated generations are never cached** | One transient blip would otherwise become a permanently wrong answer served at full speed for the whole TTL |
+
+> **Caveat worth knowing:** the cache is *content-addressed, not user-scoped* —
+> two users sending an identical prompt to an identical model share one entry.
+> That is what makes it effective on shared templates, but it means the cache
+> must never hold user-specific content. Scope it per tenant (or set
+> `LLM_CACHE=none`) if prompts can carry another user's private data.
+
+`RedisCache` shares entries fleet-wide; a per-process cache dilutes its hit rate
+with every pod you add. Cache failures always degrade to a miss — an
+optimisation must never take down correctness or availability.
+
+---
+
+## Step 15 — Circuit breaking and failover (`breaker.py`)
+
+When a vLLM replica dies, every request still queues against it, waits out the
+full timeout, and fails. One dead backend becomes fleet-wide latency: worker
+slots fill with doomed requests, the queue grows, and the autoscaler adds pods
+that also fail.
+
+```
+CLOSED ──(N consecutive failures)──► OPEN
+  ▲                                   │
+  │                        (recovery timeout elapses)
+  │                                   ▼
+  └────────(probe succeeds)────── HALF_OPEN
+                                      │
+                    (probe fails) ────┘ back to OPEN, timer restarts
+```
+
+Two subtleties that are easy to get wrong and are pinned by tests:
+
+- **Only server-side faults count.** A `400` means *we* sent something invalid;
+  tripping on client errors takes a healthy backend out of rotation because of
+  one malformed prompt.
+- **HALF_OPEN admits exactly one probe.** Releasing full load onto a recovering
+  backend knocks it straight back down.
+
+Breakers are per model, so a dead 70B backend does not stop the 1.5B backend
+from serving. On failure the service **fails over** by re-routing with the failed
+model excluded — reusing `route()` means the replacement still respects the
+complexity tier, the budget, and the context window. A pinned `force_model` is
+never silently replaced, and the response is billed at the price of the model
+that actually served it.
+
+---
+
+## Step 16 — Rate limiting and load shedding
+
+**Rate limits and spend budgets solve different problems, and you need both.** A
+dollar budget caps total damage but does nothing about a client firing 10,000
+cheap requests a second — that saturates the queue long before the budget
+notices. Conversely a rate limit alone lets a patient client burn the whole
+budget on expensive calls.
+
+`TokenBucketLimiter` permits **bursts** (real clients are bursty; a strict
+per-second limiter rejects traffic the system could absorb) while bounding the
+sustained rate. The Redis variant is atomic via Lua for the same reason the
+ledger is.
+
+Note the deliberately *opposite* outage policy: the rate limiter **fails open**,
+the spend ledger **fails closed**. A limiter is abuse control — rejecting all
+traffic because it is unreachable converts a dependency blip into a full outage.
+A ledger is cost control — serving unmetered traffic converts a blip into an
+unbounded bill.
+
+**Load shedding** completes the picture. `admission_timeout_s` bounds how long a
+request may sit in the queue; past that it is rejected with `503`. Without a
+deadline a saturated service accumulates requests whose clients have already
+given up and spends GPU time answering nobody. The critical detail: **a shed
+request refunds its reservation**, or every timeout silently bills the user for
+a generation that never happened — precisely when the system is already stressed.
+
+Throttling responses carry `Retry-After`, which turns a blind retry storm into
+coordinated backoff.
+
+---
+
+## Step 17 — Verifying it
 
 ```bash
 pip install -r requirements-dev.txt
-pytest                        # 34 tests across all components
+pytest                        # 198 tests
 python examples/demo.py       # end-to-end, no API keys
-uvicorn app.main:app --reload # then POST to /v1/infer
+uvicorn app.main:app --reload
 ```
 
-The test suite covers each layer in isolation (complexity, router, cost,
-autoscaler) plus two integration layers (`service`, `api`), so a change that
-breaks routing or budgeting fails fast and points at the responsible module.
+### The edge cases that matter
+
+`tests/test_edge_cases.py` targets failure modes that never appear in a
+happy-path demo. Each test names the incident it guards against:
+
+**Billing integrity**
+- client disconnects mid-stream → still billed for partial output
+- disconnect releases its capacity slot (leaked slots silently erode throughput
+  until the service deadlocks with an idle GPU)
+- provider crash mid-stream → billed for what was produced, not the full
+  reservation and not zero
+- failed buffered call → reservation refunded, user charged `$0`
+- `settle` is idempotent; `release` after `settle` does not erase a real charge
+- actual cost may exceed the reservation (projections are estimates)
+- 50 concurrent reservations against a `$1.00` cap grant exactly 10
+- a request landing exactly on the limit is allowed (float epsilon)
+
+**Rolling-window boundaries** — spend expires exactly at the edge; a capped-out
+user can spend again after the window rolls.
+
+**Hostile input** — empty/whitespace/null-byte prompts; emoji, CJK, accented and
+mathematical-bold text never yield a zero token count (a zero count is a free
+request); prompts exceeding every context window; `max_output_tokens` larger than
+the window; zero and negative budgets; a single-model catalog with nowhere to
+downgrade; an unknown `task_type` falling back to the heuristic rather than
+silently routing everything to SIMPLE.
+
+**vLLM transport** (`test_vllm_provider.py`, fake `httpx` transport — no server
+needed) — 429 retry-then-succeed; give-up after max retries; 400 never retried;
+timeouts vs connection refused; malformed SSE frames skipped; missing `usage`
+falling back to estimation; empty `choices`.
+
+**Redis** (`test_redis_ledger.py`, real Lua via `fakeredis`) — Lua atomicity
+under 50-way concurrency; two ledger instances sharing one budget; fail-closed
+vs fail-open on outage; `NOSCRIPT` fallback after a Redis restart; corrupt
+members skipped.
+
+**Capacity & scaling** — gate blocks past capacity and reports queue depth;
+shrink does not interrupt in-flight work; grow wakes waiters; autoscaler does not
+flap on a spike; survives `min > max` misconfiguration; counts queue depth rather
+than in-flight alone (scaling on in-flight alone means a saturated service never
+scales).
 
 ---
 
 ## Extending it
 
-- **Real provider:** implement `Provider.generate()` and map catalog names to
-  vendor model IDs; pass it to `InferenceService(provider=...)`.
-- **Persistent budgets:** back `Ledger` with Redis/Postgres — the reserve/settle
-  interface stays the same.
+- **Other providers:** implement `generate()` + `generate_stream()`; everything
+  above is provider-agnostic.
+- **Postgres ledger:** implement the same reserve/settle/release protocol; the
+  service does not care which backend it holds.
 - **Smarter routing:** replace the heuristic in `complexity.py` with a small
   classifier; the `route()` contract doesn't change.
-- **Streaming:** add a streaming method to the provider and stream the response;
-  settle the ledger on completion using the final token counts.
+- **Prefix caching:** vLLM reuses KV cache across shared prefixes — routing
+  cache-friendly requests to the same replica would cut cost further.

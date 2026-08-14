@@ -11,8 +11,65 @@ services:
       LLM_MIN_REPLICAS: "1"
       LLM_MAX_REPLICAS: "20"
       LLM_TARGET_CONCURRENCY: "4"
+      # Distributed ledger so budgets are enforced across every replica.
+      LLM_LEDGER: "redis"
+      LLM_REDIS_URL: "redis://redis:6379/0"
+      LLM_REDIS_FAIL_CLOSED: "true"
+      # Shared response cache — a per-process cache dilutes its hit rate with
+      # every replica added.
+      LLM_CACHE: "redis"
+      LLM_CACHE_TTL_S: "300"
+      # Shed rather than queue forever once the backlog exceeds this wait.
+      LLM_ADMISSION_TIMEOUT_S: "30"
+      LLM_RATE_LIMIT_BURST: "20"
+      LLM_RATE_LIMIT_PER_SECOND: "5"
+      LLM_BREAKER_THRESHOLD: "5"
+      LLM_FALLBACK_ENABLED: "true"
+      # Swap to "vllm" and point at the vllm service below to use real models.
+      LLM_PROVIDER: "mock"
+      # LLM_VLLM_BASE_URL: "http://vllm:8000"
+      # LLM_VLLM_MODEL_MAP: "small=Qwen/Qwen2.5-1.5B-Instruct,medium=Qwen/Qwen2.5-7B-Instruct"
+    depends_on:
+      redis:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz')"]
       interval: 15s
       timeout: 3s
       retries: 3
+
+  redis:
+    image: redis:7-alpine
+    # AOF keeps the spend ledger durable across restarts: losing it would reset
+    # everyone's daily budget to zero spent.
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # Real inference backend. Requires an NVIDIA GPU + nvidia-container-toolkit.
+  # Start it with:  docker compose --profile gpu up
+  vllm:
+    image: vllm/vllm-openai:latest
+    profiles: ["gpu"]
+    command:
+      - "--model"
+      - "Qwen/Qwen2.5-1.5B-Instruct"
+      - "--max-model-len"
+      - "8192"
+    ports:
+      - "8001:8000"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+volumes:
+  redis-data:
